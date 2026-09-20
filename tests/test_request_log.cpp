@@ -85,23 +85,22 @@ int main() {
     };
 
     ninfer::LoadSummary load;
-    load.target               = "qwen3_6_27b";
-    load.model_id             = "qwen3.6-27b";
-    load.weights_id           = "groupwise-int";
+    load.architecture         = "Qwen3_5ForCausalLM";
+    load.model_name           = "qwen3.6-27b";
+    load.weight_formats       = {"q4_g64_fp16", "q8_g32_fp16"};
     load.load_seconds         = 1.234567890123;
     load.upload_seconds       = 0.345678901234;
     load.artifact_bytes_read  = 1000;
     load.host_to_device_bytes = 900;
     load.peak_staging_bytes   = 128;
-    load.tensor_count         = 42;
-    load.resource_count       = 6;
+    load.device_object_count  = 42;
+    load.host_object_count    = 6;
     load.context_cost         = {
-                .transfer_source = ninfer::ContextCostPresetSource::External,
-                .prefill_source  = ninfer::ContextCostPresetSource::CompiledDefault,
-                .hardware_class  = "nvidia-geforce-rtx-5090-sm120",
-                .model_id        = "qwen3.6-27b",
-                .weights_id      = "groupwise-int",
-                .preset_path     = "local-costs.json",
+                .transfer_source   = ninfer::ContextCostPresetSource::External,
+                .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
+                .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
+                .prefill_signature = "example-prefill-signature",
+                .preset_path       = "local-costs.json",
     };
 
     ninfer::MemorySummary memory;
@@ -158,9 +157,11 @@ int main() {
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
-    failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
-    failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
-                      "server weights id missing");
+    failures += check(server.at("artifact").at("architecture") == "Qwen3_5ForCausalLM",
+                      "server target missing");
+    failures +=
+        check(server.at("artifact").at("formats") == Json::array({"q4_g64_fp16", "q8_g32_fp16"}),
+              "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
@@ -257,7 +258,7 @@ int main() {
     PreparedRequest prepared;
     prepared.enable_thinking                           = true;
     prepared.thinking_budget                           = 256;
-    prepared.effective_reasoning_effort                = ninfer::ReasoningEffort::XHigh;
+    prepared.reasoning_effort                          = ninfer::ReasoningEffort::XHigh;
     prepared.preserve_thinking                         = true;
     prepared.sampling.temperature                      = 0.6F;
     prepared.sampling.top_p                            = 0.95F;
@@ -290,12 +291,13 @@ int main() {
             "xhigh, budget 256 | media 1, prepared 120 ms | preserve thinking",
         "pretty request-start record mismatch");
     RequestLogContext default_thinking = context;
-    default_thinking.resolved_reasoning_effort.reset();
+    default_thinking.requested_reasoning_effort.reset();
     default_thinking.thinking_budget.reset();
     const std::string default_thinking_start = render_request_start(default_thinking).message;
-    failures += check(default_thinking_start.find("thinking on") != std::string::npos &&
-                          default_thinking_start.find("unresolved") == std::string::npos,
-                      "default thinking state leaks an internal resolution detail");
+    failures +=
+        check(default_thinking_start.find("thinking template default") != std::string::npos &&
+                  default_thinking_start.find("unresolved") == std::string::npos,
+              "default thinking state leaks an internal resolution detail");
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
@@ -305,8 +307,8 @@ int main() {
                       "resolved thinking mode missing");
     failures += check(started.at("request").at("thinking_budget") == 256,
                       "resolved thinking budget missing");
-    failures += check(started.at("request").at("requested_reasoning_effort").is_null() &&
-                          started.at("request").at("resolved_reasoning_effort") == "xhigh",
+    failures += check(started.at("request").at("requested_reasoning_effort") == "xhigh" &&
+                          !started.at("request").contains("resolved_reasoning_effort"),
                       "requested and resolved reasoning effort are not distinguished");
     failures += check(started.at("request").at("preserve_thinking") == true &&
                           started.at("request").at("preserve_thinking_semantic_change") == true,
@@ -340,7 +342,7 @@ int main() {
                           rejected.at("request").at("message_count") == 2,
                       "preparation rejection request shape missing");
     failures += check(rejected.at("request").at("requested_reasoning_effort") == "high" &&
-                          rejected.at("request").at("resolved_reasoning_effort").is_null(),
+                          !rejected.at("request").contains("resolved_reasoning_effort"),
                       "rejection log fabricated a resolved reasoning effort");
     failures += check(rejected.at("error").at("status") == 400 &&
                           rejected.at("error").at("code") == "context_length_exceeded" &&
@@ -407,6 +409,14 @@ int main() {
                           .budget_exhausted           = false,
                           .selected_degradation_units = 2,
                           .selected_maximal_fallback  = false,
+                          .initial_predicted_total_ns = 500000,
+                          .first_improvement_ns       = 2000,
+                          .incumbent_improvements     = 2,
+                          .search_work                = 42,
+                          .search_granted_ns          = 8000,
+                          .search_renewals            = 1,
+                          .search_discovery_used      = true,
+                          .search_overshoot_ns        = 0,
     };
     outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
@@ -414,6 +424,12 @@ int main() {
                                                    .applied               = true};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
+    failures += check(done.at("materialization").at("initial_predicted_total_ns") == 500000 &&
+                          done.at("materialization").at("first_improvement_ns") == 2000 &&
+                          done.at("materialization").at("search_granted_ns") == 8000 &&
+                          done.at("materialization").at("search_renewals") == 1 &&
+                          done.at("materialization").at("search_discovery_used") == true,
+                      "materialization search quality or cumulative budget diagnostics missing");
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");
@@ -426,6 +442,13 @@ int main() {
                           done.at("result").at("thinking_control_tokens") == 19 &&
                           done.at("result").at("thinking_control_applied") == true,
                       "thinking-control result accounting missing");
+    failures +=
+        check(done.at("result").at("tool_call_parse").at("marker_seen") == false &&
+                  done.at("result").at("tool_call_parse").at("structured_call_count") == 0 &&
+                  done.at("result").at("tool_call_parse").at("empty_arguments_omitted") == 0 &&
+                  done.at("result").at("tool_call_parse").at("schema_mismatch_arguments") == 0 &&
+                  done.at("result").at("tool_call_parse").at("fallback_reason") == "none",
+              "default tool-call parse diagnostics missing");
     outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::PrivateResponseReplay;
     const Json response_restore =
         Json::parse(format_request_done_json("serve-test", 3001, context, outcome));
@@ -467,6 +490,53 @@ int main() {
             "(25.2%, response replay) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
             "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | thinking 256/256, control 19",
         "pretty request-done record mismatch");
+
+    GenerationOutcome normalized_tool_outcome = outcome;
+    normalized_tool_outcome.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "Edit", .arguments_json = R"({"file_path":"x"})"});
+    normalized_tool_outcome.tool_call_parse = {
+        .marker_seen               = true,
+        .structured_call_count     = 1,
+        .empty_arguments_omitted   = 1,
+        .schema_mismatch_arguments = 2,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+    };
+    const Json normalized_tool_done =
+        Json::parse(format_request_done_json("serve-test", 3002, context, normalized_tool_outcome));
+    failures += check(
+        normalized_tool_done.at("result").at("tool_call_count") == 1 &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("structured_call_count") ==
+                1 &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("empty_arguments_omitted") ==
+                1 &&
+            normalized_tool_done.at("result")
+                    .at("tool_call_parse")
+                    .at("schema_mismatch_arguments") == 2 &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("fallback_reason") ==
+                "none" &&
+            !render_tool_call_fallback(context, normalized_tool_outcome),
+        "successful tool-call normalization diagnostics are incomplete or noisy");
+
+    GenerationOutcome fallback_outcome = outcome;
+    fallback_outcome.tool_call_parse   = {
+          .marker_seen               = true,
+          .structured_call_count     = 0,
+          .empty_arguments_omitted   = 0,
+          .schema_mismatch_arguments = 0,
+          .fallback_reason           = ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+    };
+    const Json fallback_done =
+        Json::parse(format_request_done_json("serve-test", 3003, context, fallback_outcome));
+    failures += check(fallback_done.at("result").at("tool_call_parse").at("marker_seen") &&
+                          fallback_done.at("result").at("tool_call_parse").at("fallback_reason") ==
+                              "duplicate_parameter",
+                      "tool-call text fallback diagnostics missing from JSONL");
+    const std::optional<OperationalRecord> fallback_warning =
+        render_tool_call_fallback(context, fallback_outcome);
+    failures += check(
+        fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
+            fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
+        "tool-call text fallback warning is absent or exposes raw content");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

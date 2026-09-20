@@ -27,9 +27,10 @@ replica 和 consumer view 的物理合同由 [Paged KV Context Store](paged-kv-c
 | resource plan | Program 针对一个 target seal 的有序物理 transition |
 | placement | 一个完整 StateImage 或一个 KV logical page 的 Device/Host replica 状态 |
 
-本文后续简称 planning target 为 `target`；注册模型及其 package 写作 `model target`，两者不是同一概念。
+本文后续简称 planning target 为 `target`，表示一次资源决策的终态。
 
-Prefix reuse 是 admission 的一种来源选择。它减少重复 prefill，但不改变模型语义、请求顺序或生成结果。
+Prefix reuse 是 admission 的一种来源选择。它复用具有完整身份和状态覆盖的已计算前缀，减少重复
+prefill，保持模型语义和请求顺序。不同 prefill 分块或数值路径之间不要求 logits 或生成 token 完全相同。
 
 当前产品条件为单 GPU、单 resident model、固定 `max_concurrency=1..8` 和非抢占 active requests。
 由此得到两个基本规则：
@@ -119,6 +120,9 @@ PhysicalCapacity = {
 }
 ```
 
+容量依据加载后的模型配置、实际权重绑定、启用组件及启动选项推导。权重的物理表示影响执行
+workspace 和可用预算；KV/GDN 的数学状态、具体存储和容量由模型实现与 Program 分别负责。
+
 这些轴相互独立。一个资源轴的余量不能补偿另一个轴的缺口。Host KV 的总空闲字节也不能替代
 allocator 对具体 extent 几何的可分配性判断。
 
@@ -156,6 +160,13 @@ Used_r(S)=
 
 同一个物理 allocation 被多个 checkpoints 或 address spaces 引用时只计一次。已经物化的容量计
 allocation，尚未物化但被保护的容量计 reservation；同一容量单位不能同时计入两项。
+
+全局物理占用与 owner-exclusive resources 是两个不同视图。前者直接来自 State/KV stores 的 unique
+allocations 与 concrete reservations；后者只表示单独移除一个 owner 时能够结算的资源。一个同时被
+private checkpoint 与 shared prefix 引用的 allocation 在全局占用中计一次，但在任一 owner 的 exclusive
+resources 中都不计。Owner-exclusive resources 可用于 eviction effect、ownership transfer 和 active
+entitlement 校验，不能用于判断一个 checkpoint 是否具有 resident replica；后者只能查询对应 physical
+store。
 
 每个稳定状态和 transition 中间状态都必须满足：
 
@@ -242,7 +253,7 @@ state 内容时，不改变全局可用容量，因此不推进 revision。
 
 ### 4.1 完整恢复条件
 
-当前 model targets 同时包含可分页 Full Attention KV 和不能从任意较晚状态无损回退的 recurrent state。
+当前 Qwen3.5 模型同时包含可分页 Full Attention KV 和不能从任意较晚状态无损回退的 recurrent state。
 因此某个 frontier 可以复用，当且仅当 Program 能证明：
 
 1. 存在该 frontier 的完整 StateImage；
@@ -314,6 +325,22 @@ Program 的 exact verification 可以使用：
 
 Session key、marker、hash 和 prefix index 只缩小 candidate 集合，不证明命中。
 
+`rewrite_execution_frontiers` 也是 exact identity 的一部分。它记录 replay/root prefill 必须分段的 exact
+token frontiers，使重建路径采用与原生成路径一致的 execution decomposition；不能为了采用 endpoint 而忽略。
+当 NInfer 自己生成的 accepted output 形成可由历史 renderer 精确重建的边界时，所有权链固定为：
+
+```text
+Frontend detects the model-output reconstruction boundary
+  -> Engine transports relative accepted-prefix metadata
+  -> Program atomically commits resident identity and shortlist digest
+```
+
+Frontend 只在 canonical boundary 恰好结束于 token frontier 时发布 metadata，并让 preview rollback、stop
+truncation 和 speculative partial accept 服从同一个 accepted-prefix transaction。Program 把相对位置转换为
+resident absolute frontier，并与 token ledger、State/KV 和 backend state 一起提交；它不扫描输出文本。
+ResourceManager 不推断或放宽这个事实。这样未经客户端改写的 NInfer 输出可以继续采用 exact endpoint；客户端
+重排 tool JSON、补默认值或改写历史仍是不同的 rendered identity，只能匹配更早的合法 checkpoint。
+
 ### 4.6 Request cache participation
 
 每个请求在进入 Engine 前固定一种语义：
@@ -352,6 +379,15 @@ State transition 的语义只有：
 
 Program 根据完整 post-state 选择 Move 或 Fork。Fork source 在 destination 首次 state-writing commit 完成前
 保持 pin；该结算属于 active model transaction，不能与新的 global resource transition 重叠。
+
+Active State binding 同时记录 read source 的生命周期归属。Root、Move、Restore 和 active-capture Fork
+的初始 read 由当前 sequence 提供；从 retained source 或仍有 surviving checkpoint reference 的 consumed
+source 建立 Fork 时，read 由 surviving owner/reference graph 保留，active primary binding 只拥有
+write destination。这个 borrowed read 参与全局物理占用并由 source pin 保护，但不能通过 primary binding
+再次计费，也不能仅凭 primary binding 在 abort/release 时释放；若 surviving checkpoint 本身是 active
+lineage 独占的 optional checkpoint，它只通过该 checkpoint ownership 计入 entitlement，并在该 ownership
+结算后决定 source 是否可释放。Fork settlement 后 read/write 都切换到 destination，生命周期重新归属
+active sequence。
 
 ### 5.2 Typed KV
 
@@ -406,6 +442,12 @@ required Device checkpoint prefix
 
 Active truncate 或 speculative rollback 可以解除 mappings，但对应容量仍属于该 active reservation。
 只有 terminal release 或明确缩减 active entitlement 的资源 transition 才能把容量归还全局。
+
+Active entitlement 只包含 active owner 的 destination、私有增长 reservation 和已归属于该 lineage 的
+exclusive optional resources。Fork 期间借用的 immutable StateImage/KV source 不能通过 primary binding
+再次计费：它若由其他 surviving owner 保留则只存在于全局 physical occupancy，若由 active lineage 的
+optional checkpoint 独占则只通过该 checkpoint 计一次。否则同一 allocation 会被重复收费，并把合法的
+Fork 错判为超出 active guarantee。
 
 ### 6.2 Terminal 与 capture
 
@@ -466,6 +508,12 @@ Shared prefix 的三个状态不能混为一谈：
 外部协议或 C++ `PromptInput` 每个请求最多提交四个显式 markers。Frontend 还可以生成最多三个 Engine
 candidates：全部 tools 之后、连续 leading System/Developer 之后，以及 full prompt。相同 frontier 合并，
 因此每个请求最多七个 prepared candidates。这个固定上限不是启动配置。
+
+Shared catalog 是 Engine-wide 公共容量，不是每条 lineage 的配额。启用 context cache 时，默认 logical
+capacity 同时覆盖 active concurrency 下限和单请求最多四个显式 markers，即
+`max(max_concurrency, kMaximumExplicitPromptCacheMarkers)`；显式配置仍完整覆盖默认值。这个下限允许较早的
+稳定层与较晚的滚动 marker 同时成为 owner，但是否 capture、保留或替换仍只由通用 portfolio/pressure
+planning 决定，不提供 Claude、compact 或 token-position 特例。
 
 Candidate 保存 evidence flags。策略含义为：
 
@@ -579,6 +627,10 @@ AttentionPairs = B\,S+\frac{S(S+1)}{2}
 其中 \(B\) 是已复用 prefix tokens，\(S\) 是剩余 suffix tokens。Vision item/patch work 使用同一
 startup-resolved machine model 的独立分量。
 
+Transfer 系数按硬件选择，prefill 系数按硬件与实际 Text/Vision config、绑定结构和 Use 生成的
+`prefill_signature` 选择。签名不使用 checkpoint/release 名称，也不包含权重数值。两组系数独立
+解析；没有匹配的标定时使用对应的通用系数。成本只影响可行方案之间的排序，不是加载或执行门槛。
+
 ### 8.3 Portfolio value 与 future loss
 
 ResourceManager 保存最近 32 个成功 materialize 为 Active 的请求。每条 demand record 保存 reuse domain
@@ -654,17 +706,13 @@ Selected source 的合法 `ConsumedToActive` 是 ownership transfer，不计作 
 
 ### 8.4 排序提示不是证明
 
-Program 为未 assessment 的 target 返回 physical residual、预计剩余步数、transfer work 和稳定 ordinal。
-ResourceManager 将其与 selected hits、retention weight、shared credit 和 hit epoch 合并成确定性 priority。
-这些值只决定先探索谁：
+Program 为未 assessment 的 target 返回 physical residual、预计剩余步数、transfer/recovery work 和
+稳定 ordinal。ResourceManager 将这些事实与 portfolio policy、logical publication 条件合并成 priority。
+构造目标同时包含物理容量和逻辑可采用性；物理缺口为零不能代替 publication slot 检查。
 
-- 不能标记 target feasible；
-- 不能排除 candidate 或 target；
-- 不能证明 incumbent 最优；
-- 不能参与 physical readiness。
-
-只有完整 exact assessment 与 logical-adoption check 可以产生可采用方案。日志不再发布
-`model_optimal`、remaining lower bound 或 bound gap。
+这些值只决定探索顺序及 optional 额度边界是否值得继续搜索：不能标记 target feasible，不能证明
+incumbent 最优，不能参与 physical readiness。组合动作可能取消拷贝，预测成本不是可用于剪枝的
+数学下界。只有完整 exact assessment 与 logical-adoption check 可以产生可采用方案。
 
 ### 8.5 无压力路径
 
@@ -695,33 +743,34 @@ lane 或 open transaction 阻塞，结果为 temporarily blocked。
 
 ### 8.7 有界 heuristic search
 
-Materialization 与 shared capture 使用两个 typed entrypoint。Materialization 的 incumbent 是已验证 identity
-或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
+Materialization 与 shared capture 使用两个 typed entrypoint。Materialization 的 incumbent 是已验证
+identity 或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
 
 一次 planning problem 中：
 
-1. ResourceManager mint `PlanningCandidateId`、`PlanningOwnerId` 并保留到 catalog capability 的唯一映射；
-2. Program 为每个 candidate 建立只包含 eligible victims 的 domain，source 结构性缺席；
-3. target 是 Program-owned opaque handle；runner 不构造 State/KV action；
-4. guidance 只排列 frontier；
-5. Program exact evaluator 从完整联合 post-state 结算 unique State/KV identity、alias、placement、Move/Fork、
-   COW、Host geometry 和 stage peak；
-6. ResourceManager 按 owner ID 判断 logical adoption 与 future value；
-7. budget 耗尽时返回最佳已验证 incumbent。
+1. ResourceManager mint candidate/owner IDs，保留到 catalog capability 的唯一映射；Program 为每个
+   candidate 建立 selected source 结构性缺席的 eligible victim domain。
+2. Program 持有 opaque targets 与分片构造状态；Runtime 按预计完整 J 和缺口改善排列合法选项，
+   兼顾价值与尽快形成可行方案，不构造 State/KV action。
+3. 优先评估完整候选，失败后根据精确物理与逻辑反馈继续修复。Host geometry 等不能由总字节量
+   证明的条件需要更早的 exact feedback。局部构造以外保留普通 alternatives。
+4. 完整联合 post-state 结算 unique objects、alias、Move/Fork、COW、Host geometry 与 stage peak。
+   只有物理可行且 logical adoption 成功的结果参与最终 J 与稳定 tie-break 比较。
+5. 任意 optional 时间、工作或容量预算耗尽，返回最佳已验证 incumbent。
 
-普通 expansion、guided closure、root maximal 与 seal 使用同一 candidate-specific domain 和同一 exact
-evaluator。不存在另一套 source/victim eligibility 规则，也不存在 synthetic capture
-`AdmissionCandidate` 跨越 common planner 边界。
+构造、修复、普通 expansion、maximal target 与 seal 共用 candidate-specific domain 和 exact evaluator。
+游标、target arena 与借用摘要只在同一 planning session/revision 内有效；批次停止或丢弃不能产生
+真实资源 mutation。结束搜索后不跨 decode/prefill 恢复旧状态。
 
-Search management 使用 ordinal-indexed `BoundedTargetLedger`。Program target choices 存放在
-planning-session-owned flat arena；每个 target 只保存 offset/count，canonical lookup 使用 flat hash。Prepare
-expansion 在 arena 尾部建立 scratch，commit 只保留新 canonical targets，discard 回卷到原 mark。Session
-开始时按固定 target/owner 上限取得容器容量；capacity exhaustion 返回已有 incumbent，不能改变 correctness。
+Engine 提供 admission boundary 共享的 optional 时间额度，head/backfill inspections 不能各自重置。
+预算考虑其他 runnable 请求及本 boundary 已花费的时间。Planner 先用短窗口搜索，再根据尚可获得
+的预计改善和完成成本决定是否续额；不完整预测只有受限探索机会，已实现收益不能反复用于续额。
+Target、工作量和 session storage 仍独立有界。
 
-Target budget 同时约束 canonical targets 与 exact assessments。Materialization 另在不可分的 Program
-operation 之间检查 wall/value budget；identity assessments 和 root maximal correctness assessment 不计
-optional budget。Shared capture 以固定 target budget 约束工作量，incumbent 始终为 Skip。任何 budget 只影响
-cache quality，不改变 mandatory request readiness。
+Identity 与 root maximal correctness assessment 不因 optional 额度耗尽而取消。时间在 Program
+operation 之间检查，估计误差可造成单步越界；最终 seal 仍必须完成。因此预算只影响 cache quality，
+不改变 mandatory readiness，也不承诺整个 planning 调用可在任意时刻中断。
+Shared capture 维持独立的固定 target budget 与 Skip incumbent。
 
 ### 8.8 目标函数与确定性
 
@@ -747,7 +796,8 @@ machine cost model 统一定价并比较。成本模型不会进入 Program API�
 6. candidate 与 target 的稳定 ordinal。
 
 停止原因只描述实际边界：`no_pressure`、`queue_exhausted`、`target_budget`、
-`expansion_capacity`、`time_budget` 或 `value_of_next_expansion`。它们不声明当前 target graph 或真实
+`expansion_capacity`、`time_budget`、`work_budget` 或 `insufficient_expected_gain`。
+`time_budget` 也包括预计下一不可分操作无法放入余量的情况。它们不声明当前 target graph 或真实
 TTFT 的全局最优性。
 
 ### 8.9 Readiness
@@ -967,18 +1017,19 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
 
 | 职责 | 主要位置 |
 |---|---|
-| logical catalog、claims、session policy | `src/runtime/engine/resource_manager.h` |
-| bounded target ledger 与 common search primitives | `src/runtime/engine/resource_search.h` |
-| cross-candidate bounded planner | `src/runtime/engine/materialization_planner.h` |
-| typed shared-capture bounded entrypoint | `src/runtime/engine/shared_capture_planner.h` |
-| shared/private portfolio value | `src/runtime/engine/context_portfolio_value.h` |
-| machine cost model | `src/runtime/engine/context_cost.*` |
-| common resource summaries | `src/runtime/contract/types.h` |
-| unique-object projection contract | `src/targets/qwen3_6/impl/runtime/resource_projection.h` |
-| target domain、projection 与 transaction | `src/targets/qwen3_6/impl/runtime/program*.h`、`pressure_planner.h` |
-| State stores | `src/targets/qwen3_6/impl/runtime/state_image_store.h` |
-| logical KV/address spaces | `src/targets/qwen3_6/impl/runtime/logical_kv_store.h` |
-| Host KV extents | `src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h` |
+| logical catalog、claims、session policy | `src/runtime/engine/context_cache/resource_manager.h` |
+| bounded target ledger 与 common search primitives | `src/runtime/engine/context_cache/resource_search.h` |
+| cross-candidate bounded planner | `src/runtime/engine/context_cache/materialization_planner.h` |
+| typed shared-capture bounded entrypoint | `src/runtime/engine/context_cache/shared_capture_planner.h` |
+| shared/private portfolio value | `src/runtime/engine/context_cache/context_portfolio_value.h` |
+| machine cost model | `src/runtime/engine/context_cache/context_cost.cpp` |
+| prefill measurement signature | `src/models/qwen3_5/measurement.cpp` |
+| common resource summaries | `src/runtime/contract/resources.h` |
+| unique-object projection contract | `src/models/qwen3_5/program/planning/resource_projection.h` |
+| target domain、projection 与 transaction | `src/models/qwen3_5/program/planning/`、`src/models/qwen3_5/program/transactions/` |
+| State stores | `src/models/qwen3_5/program/storage/state_store.h` |
+| logical KV/address spaces | `src/models/qwen3_5/program/storage/kv_store.h` |
+| Host KV extents | `src/models/qwen3_5/program/storage/host_kv_store.h` |
 | public capacity options | `include/ninfer/types.h` |
 
 路径用于定位当前实现，不改变本文定义的所有权边界。

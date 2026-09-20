@@ -15,7 +15,7 @@
 
 namespace {
 
-using Json = nlohmann::json;
+using Json = ninfer::serve::RequestJson;
 using namespace ninfer::serve;
 
 int check(bool condition, const std::string& label) {
@@ -51,9 +51,7 @@ OpenAIChatRequest parse(Json body) { return parse_chat_completion_request(body, 
 
 ResolvedPromptSemantics semantics(const GenerationRequest& request) {
     ServeOptions server;
-    ninfer::PromptCapabilities capabilities;
-    capabilities.enable_thinking = true;
-    return resolve_prompt_semantics(request, server, capabilities);
+    return resolve_prompt_semantics(request, server);
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {
@@ -342,6 +340,15 @@ int test_tools() {
                               ninfer::PromptCacheMarkerLocation::MessageBoundary &&
                           mixed_prompt.context_cache.markers.back().after_message_count == 2,
                       "automatic caching stops after a complete assistant text/tool-call turn");
+
+    const Json ordered = Json::parse(
+        R"({"model":"qwen","messages":[{"role":"user","content":"probe"}],"tools":[{"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}}}]})");
+    const ninfer::PromptInput ordered_prompt = prompt(parse(ordered).generation);
+    failures += check(
+        ordered_prompt.options.tool_jsons.size() == 1 &&
+            ordered_prompt.options.tool_jsons.front() ==
+                R"({"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}},"strict":false}})",
+        "OpenAI Chat changed tool-schema member order before PromptInput");
     return failures;
 }
 
@@ -530,8 +537,8 @@ int test_reasoning_and_extensions() {
     body                         = base_request();
     body["chat_template_kwargs"] = Json{{"future", 1}};
     failures +=
-        check(api_error([&] { (void)parse(body); }).code == "chat_template_option_not_supported",
-              "unknown meaningful template option rejected");
+        check(Json::parse(parse(body).generation.chat_template_kwargs_json).at("future") == 1,
+              "custom template keyword did not survive protocol parsing");
     body["chat_template_kwargs"] = Json{{"future", nullptr}};
     failures += check(parse(body).generation.messages.size() == 1,
                       "null unknown template option is neutral");
@@ -628,16 +635,19 @@ int test_aggregate_response() {
         "aggregate timings use exact cache and N-1 generation intervals");
 
     outcome.text.clear();
-    outcome.tool_calls.push_back(
-        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = R"({"city":"Paris"})"});
+    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "Edit",
+        .arguments_json =
+            R"({"file_path":"/tmp/probe.cpp","old_string":"old","new_string":"new"})"});
     response         = Json::parse(make_chat_completion_response(identity(), outcome));
     const Json& call = response["choices"][0]["message"]["tool_calls"][0];
     failures += check(response["choices"][0]["finish_reason"] == "tool_calls" &&
                           response["choices"][0]["message"]["content"].is_null(),
                       "aggregate tool call has OpenAI terminal shape");
-    failures += check(call["id"].get<std::string>().starts_with("call_") &&
-                          call["function"]["name"] == "weather",
-                      "OpenAI adapter owns wire tool-call identifiers");
+    failures += check(
+        call["id"].get<std::string>().starts_with("call_") && call["function"]["name"] == "Edit" &&
+            !Json::parse(call["function"]["arguments"].get<std::string>()).contains("replace_all"),
+        "OpenAI adapter owns wire tool-call identifiers");
     return failures;
 }
 
@@ -679,14 +689,15 @@ int test_stream_response() {
     OpenAIChatStream tool_stream(identity(), false);
     (void)tool_stream.start();
     GenerationOutcome tool_outcome;
-    tool_outcome.tool_calls.push_back(
-        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = "{}"});
+    tool_outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name = "Edit", .arguments_json = R"({"file_path":"/tmp/probe.cpp"})"});
     tool_outcome.finish_reason                 = ninfer::FinishReason::StopToken;
     const std::vector<std::string> tool_events = tool_stream.finish(tool_outcome);
     const Json tool_delta                      = parse_sse(tool_events[0]);
     failures += check(
         tool_delta["choices"][0]["delta"]["tool_calls"][0]["id"].get<std::string>().starts_with(
             "call_") &&
+            tool_delta["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "Edit" &&
             parse_sse(tool_events[1])["choices"][0]["finish_reason"] == "tool_calls",
         "stream encoder owns stable OpenAI tool-call shape");
     return failures;

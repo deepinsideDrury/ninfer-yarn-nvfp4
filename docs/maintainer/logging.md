@@ -38,7 +38,7 @@ or shutdown behavior.
 
 No code may call spdlog's global default logger, mutate its global pattern or level, or register an
 application logger in the global registry. `ninfer_core`, `ninfer_artifact`, `ninfer_ops`,
-`ninfer_engine`, and target packages do not link product logging. These layers communicate an
+`ninfer_engine`, and model libraries do not link product logging. These layers communicate an
 observable diagnostic through an owning typed event/callback; the product adapter decides whether
 to log it.
 
@@ -139,8 +139,9 @@ in a burst. A partial shutdown interval may be retained by JSONL, but does not c
 pretty throughput record.
 
 Engine startup is an inclusive typed hierarchy. `engine-startup` contains CUDA initialization,
-artifact inspection, target planning, weight materialization, target/frontend/Program construction,
-and Engine finalization. `weights-staging-pin` is nested in `weights-materialize`; Host State pin,
+artifact inspection, semantic binding, weight materialization, model/frontend construction,
+runtime resource planning, Program construction and Engine finalization. `weights-staging-pin`
+is nested in `weights-materialize`; Host State pin,
 Host KV pin, and CUDA Graph preparation are nested in `program-initialize`. Nested durations explain
 their parent and must not be added to it. Disabled zero-capacity phases are omitted. Byte progress is
 reported as submitted work, while only a synchronized terminal event reports completed bytes.
@@ -154,6 +155,11 @@ machine terminal: `request_done` immediately after `GenerationService::run()` re
 `request_error` if it does not return an outcome. Response rendering, Responses storage, and terminal
 transport happen after that transaction; their failures are operational `response` records and do
 not create a second request JSONL terminal.
+
+Tool-call parameter normalization remains a successful request outcome. Empty-argument omissions
+and schema mismatches are machine-only counters. If a complete tool marker must be returned to text
+because its structure or declared identity cannot be represented, Serve emits one warning carrying
+only the stable fallback classification; generated markup and arguments remain excluded.
 
 There is no dual spdlog/custom operational path. Product results, machine measurements, and the
 explicit emergency cases above remain direct outputs because they are different contracts.

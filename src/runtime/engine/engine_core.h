@@ -5,11 +5,12 @@
 #include "core/device.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
-#include "runtime/contract/types.h"
+#include "runtime/contract/execution.h"
+#include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
-#include "runtime/engine/resource_manager.h"
+#include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
-#include "runtime/generation/generation_budget.h"
+#include "runtime/engine/generation_budget.h"
 
 #include <algorithm>
 #include <array>
@@ -39,17 +40,17 @@ template <class Instance>
 class EngineCore {
 
 public:
-    using Package            = typename Instance::Package;
-    using Program            = typename Package::Program;
-    using BasePlan           = typename Package::RequestBasePlan;
-    using Plan               = typename Package::AdmissionCandidate;
-    using SequenceHandle     = typename Package::SequenceHandle;
-    using CaptureOffer       = typename Package::CaptureOffer;
-    using PendingBatch       = typename Package::PendingBatch;
-    using PreparedPrompt     = typename Package::PreparedPrompt;
-    using OutputSession      = typename Package::OutputSession;
-    using PublishedOutput    = typename Package::PublishedOutput;
-    using Request            = RequestRecord<Package>;
+    using ModelContract      = typename Instance::ModelContract;
+    using Program            = typename ModelContract::Program;
+    using BasePlan           = typename ModelContract::RequestBasePlan;
+    using Plan               = typename ModelContract::AdmissionCandidate;
+    using SequenceHandle     = typename ModelContract::SequenceHandle;
+    using CaptureOffer       = typename ModelContract::CaptureOffer;
+    using PendingBatch       = typename ModelContract::PendingBatch;
+    using PreparedPrompt     = typename ModelContract::PreparedPrompt;
+    using OutputSession      = typename ModelContract::OutputSession;
+    using PublishedOutput    = typename ModelContract::PublishedOutput;
+    using Request            = RequestRecord<ModelContract>;
     using Scheduling         = Scheduler<Request>;
     using FifoSnapshot       = typename Scheduling::FifoSnapshot;
     using RoundMembership    = typename Scheduling::RoundMembership;
@@ -57,7 +58,7 @@ public:
     using ActiveAdmissionSet = typename Scheduling::ActiveAdmissionSet;
     using ExecutionAction    = typename Scheduling::ExecutionAction;
     using AdmissionGrant     = typename Scheduling::AdmissionGrant;
-    using ResourceManagement = ResourceManager<Package>;
+    using ResourceManagement = ResourceManager<ModelContract>;
     using ResourceInspection = typename ResourceManagement::Inspection;
     using Clock              = std::chrono::steady_clock;
 
@@ -199,7 +200,7 @@ public:
 
         std::shared_ptr<Request> request;
         try {
-            auto output = instance_.loaded->frontend.make_output_session(
+            auto output = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking);
             const std::uint32_t capacity_output =
                 max_context_ - prompt_summary.prompt_tokens + static_cast<std::uint32_t>(1);
@@ -850,6 +851,7 @@ private:
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.tool_calls              = request->output.take_tool_calls();
+        result.tool_call_parse         = request->output.tool_call_parse_diagnostics();
         result.reasoning_tokens        = request->output.reasoning_tokens();
         result.finish_reason           = reason;
         result.matched_stop_string     = request->output.matched_stop_string();
@@ -1113,13 +1115,17 @@ private:
                     row_tokens, request->budget->remaining(), request->budget->limit_reason());
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                     (!decision.finished() && decision.accepted_tokens != count) ||
-                    (decision.finished() && decision.continuation != ContinuationAction::Decode)) {
+                    (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
+                    (decision.prefix_execution_split_after &&
+                     (*decision.prefix_execution_split_after == 0 ||
+                      *decision.prefix_execution_split_after > decision.accepted_tokens))) {
                     throw std::logic_error("output policy returned an invalid licensed prefix");
                 }
                 decisions[row] = CommitDecision{
-                    .accepted_tokens = decision.accepted_tokens,
-                    .terminal        = decision.finished(),
-                    .cancelled       = false,
+                    .accepted_tokens              = decision.accepted_tokens,
+                    .terminal                     = decision.finished(),
+                    .cancelled                    = false,
+                    .prefix_execution_split_after = decision.prefix_execution_split_after,
                 };
                 finish_reasons[row] = decision.finish_reason;
                 continuations[row]  = decision.continuation;
@@ -1151,7 +1157,7 @@ private:
             std::rethrow_exception(error);
         }
 
-        std::optional<typename Package::CommitResult> committed_storage;
+        std::optional<typename ModelContract::CommitResult> committed_storage;
         try {
             phase.pause_range();
             ProgramCallScope program_call(*this);
@@ -1321,7 +1327,7 @@ private:
 
     void
     resolve_prefill_progress(const std::shared_ptr<Request>& request,
-                             typename Package::PrefillProgress&& progress,
+                             typename ModelContract::PrefillProgress&& progress,
                              const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         ++cumulative_stats_.host_work.prefill_units;
@@ -1428,9 +1434,15 @@ private:
         }
     }
 
-    [[nodiscard]] ResourceInspection inspect_admission(const std::shared_ptr<Request>& request) {
+    [[nodiscard]] ResourceInspection inspect_admission(const std::shared_ptr<Request>& request,
+                                                       PlanningAllowance allowance) {
+        allowance.cancellation = &request->cancelled;
+        allowance.control_deadline_ns =
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           request->deadline.time_since_epoch())
+                                           .count());
         return resources_.inspect(*instance_.program, request->prompt, *request->base_plan,
-                                  request->publication_order);
+                                  request->publication_order, allowance);
     }
 
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
@@ -1642,6 +1654,12 @@ private:
     }
 
     AdmissionProgress try_admit_one() {
+        const auto other_runnable = static_cast<std::uint32_t>(
+            std::count_if(slots_.begin(), slots_.end(), [](const auto& request) {
+                return request && !request->capture_pending &&
+                       (request->is_decode_ready() || request->is_prefilling());
+            }));
+        const PlanningAllowance allowance = PlanningAllowance::boundary(other_runnable);
         DetailScope detail(*this, &RuntimeHostWorkStats::admission_policy_ns,
                            &RuntimeHostWorkStats::admission_policy_invocations,
                            nvtx::Name::AdmissionPolicy);
@@ -1680,7 +1698,7 @@ private:
                 control_progress = true;
                 continue;
             }
-            auto head_inspection = inspect_admission(head);
+            auto head_inspection = inspect_admission(head, allowance);
             if (head_inspection.readiness == Readiness::PermanentlyInfeasible) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
@@ -1754,7 +1772,7 @@ private:
                     control_progress = true;
                     continue;
                 }
-                auto candidate_inspection = inspect_admission(candidate);
+                auto candidate_inspection = inspect_admission(candidate, allowance);
                 if (candidate_inspection.readiness == Readiness::PermanentlyInfeasible) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(
@@ -1809,6 +1827,7 @@ private:
         }
 
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
+        std::array<std::optional<std::uint32_t>, kMaximumConcurrency> prefix_execution_splits{};
         bool generated_staged         = false;
         const auto rollback_generated = [&]() noexcept {
             if (!generated_staged) { return; }
@@ -1844,9 +1863,13 @@ private:
                 const OutputDecision decision =
                     request->output.preview_control(tokens, request->budget->remaining());
                 if (decision.accepted_tokens != membership.row_stride || decision.finished() ||
-                    decision.continuation != ContinuationAction::Decode) {
+                    decision.continuation != ContinuationAction::Decode ||
+                    (decision.prefix_execution_split_after &&
+                     (*decision.prefix_execution_split_after == 0 ||
+                      *decision.prefix_execution_split_after > decision.accepted_tokens))) {
                     throw std::logic_error("target control preview returned an invalid decision");
                 }
+                prefix_execution_splits[row] = decision.prefix_execution_split_after;
                 if (request->generated.size() > request->generated.capacity() ||
                     tokens.size() > request->generated.capacity() - request->generated.size()) {
                     throw std::logic_error(
@@ -1858,6 +1881,8 @@ private:
             ProgramCallScope program_call(*this);
             const runtime::ExecutionTiming timing = instance_.program->append_forced_tokens(
                 membership.sequence_span(), membership.tokens, membership.row_stride,
+                std::span<const std::optional<std::uint32_t>>(prefix_execution_splits.data(),
+                                                              membership.size),
                 &program_call.failed_timing());
             program_call.finish(timing);
             phase.resume_range();

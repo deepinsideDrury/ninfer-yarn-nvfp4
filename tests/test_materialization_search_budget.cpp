@@ -14,7 +14,7 @@
 // govern (so cheap requests are unaffected), and for a realistically expensive incumbent the
 // budget must comfortably exceed what a real search needs.
 
-#include "runtime/engine/materialization_planner.h"
+#include "runtime/engine/context_cache/materialization_planner.h"
 
 #include <cstdint>
 #include <iostream>
