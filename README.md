@@ -90,6 +90,49 @@ ceiling add no memory.
 factor 4 accepts it. The `ninfer_yarn_test` unit test checks that factor 1 reproduces the engine's
 shipped frequency table to < 1e-6.
 
+### Speculative decoding past the native window (verified in this fork, 2026-09-30)
+
+Closes the MTP/DFlash caveat below for this fork: both speculative backends were served at the
+500K configuration (`--rope-yarn-factor 4 --rope-original-max-position 262144 --max-context
+500000 --kv-capacity 500000 --kv-dtype nvfp4`, CUDA graphs on, thinking mode, `--max-concurrency
+2`) and measured on a fixed prompt set by [`tools/bench_ab/`](tools/bench_ab/). The long case is a
+420,860-token needle prompt — 158,716 tokens past the native 262,144 window — and both engines
+retrieved the planted sentence verbatim. Prefill/decode rates and draft acceptance per engine:
+
+| prompt | engine (draft budget) | prefill tok/s | decode tok/s | draft proposed | draft accepted | accept % |
+|---|---|---|---|---|---|---|
+| 61 | dflash2 (7) | 1,595 | 218 | 593 | 170 | 28.7 |
+| 61 | mtp (3) | 1,582 | 189 | 258 | 124 | 48.1 |
+| 288 | dflash2 (7) | 5,162 | 373 | 686 | 412 | 60.1 |
+| 288 | mtp (3) | 5,142 | 173 | 684 | 283 | 41.4 |
+| 206,731 | dflash2 (7) | 3,174 | 259 | 168 | 93 | 55.4 |
+| 206,731 | mtp (3) | 3,187 | 175 | 247 | 171 | 69.2 |
+| 420,860 | dflash2 (7) | 1,704 | 166 | 189 | 80 | 42.3 |
+| 420,860 | mtp (3) | 1,711 | 134 | 213 | 139 | 65.3 |
+
+Findings:
+
+- **DFlash2 decodes faster than MTP at every measured scale** (1.15x / 2.15x / 1.48x at
+  61 / 288 / 206,731 tokens, 1.24x at 420,860): roughly 3.9 output tokens per verify round vs
+  3.0 for MTP, despite the lower per-draft acceptance.
+- **Acceptance degrades past the native window — more for DFlash2 than MTP** (55.4% to 42.3%
+  from 206K to 420K, vs 69.2% to 65.3% for MTP). The masked draft's RoPE table
+  (`kDflashRopeInvFrequency`, full-head D128, theta 1e7) is a fixed device constant and is *not*
+  YaRN-scaled, while the MTP draft layer runs on the target's scaled text table. Yarn-scaling the
+  DFlash table is the natural follow-up to close that gap.
+- **Prefill is engine-identical** (1,704 vs 1,711 tok/s at 420K), as expected; the 3.2k to 1.7k
+  prefill drop from 206K to 420K matches the non-speculative rows above.
+- **Startup fix this fork required:** merging upstream master re-introduced a strict
+  `max_context > draft.max_position_embeddings` check in `validate_target_options` that rejected
+  every DFlash2 start with `--max-context` above 262,144
+  (`max_context exceeds the selected draft position capacity`), while MTP — which carries no
+  separate draft config — started fine. The check now extends the draft ceiling by the same YaRN
+  factor as the text path (commit `469e1d09`); factor 1 is upstream behaviour unchanged.
+
+Note: the model runs in thinking mode, so a short `max_tokens` budget truncates *reasoning*
+before the final answer line — answer completeness in the early rows is a budget effect, not an
+engine failure. The 420K needle (budget 768) completed and was exact on both engines.
+
 ---
 
 ## Usage
@@ -182,8 +225,10 @@ A tier must leave room for the answer under `--max-context` (700 output tokens a
   tok/s, decode 48.6 → 33.1). The cause was not isolated — candidates are memory pressure at ~98%
   VRAM under WSL2 and the split-K clamp doing more work per split at that key count. 500K is the
   number to plan around on a 32 GB card.
-- **MTP / DFlash speculative decoding has not been validated with this port.** The draft head shares
-  the rope tables so it should follow, but every number here is single-stream, no speculation.
+- **MTP / DFlash speculative decoding** was not part of the original single-stream validation; in
+  this fork both backends were subsequently validated at 420,860 tokens — see
+  [Speculative decoding past the native window](#speculative-decoding-past-the-native-window-verified-in-this-fork-2026-09-30).
+  The non-speculative table above remains the reference for positional quality.
 - **`k8v4` uses ~40% more KV memory per token than `nvfp4`** (9.90 vs 7.18 GiB at 400K) and does not
   fit 500K on this card.
 - **Multi-concurrency, vision inputs, and the `bf16` / `int8` decode paths past 262,144 were not
@@ -228,6 +273,16 @@ All changes are on top of upstream `6e2786c5`; `git log origin/master..HEAD` sho
   exactly `F`, and produce the expected scale.
 
 ---
+
+
+## Fork notes (deepinsideDrury)
+
+- Upstream (Neroued/ninfer) `master` merged through `4201b5d2` (2026-09-30); the YaRN work above
+  is unchanged except where noted.
+- [`tools/bench_ab/`](tools/bench_ab/) — MTP vs DFlash2 A/B harness (drivers, fixed prompts,
+  deterministic long-prompt generator) behind the speculative results in [Results](#results).
+- Deployment examples for an artifact carrying both drafts (quasar build):
+  `tools/bench_ab/serve/dflash2.sh` and `tools/bench_ab/serve/mtp.sh`.
 
 ## Related
 
