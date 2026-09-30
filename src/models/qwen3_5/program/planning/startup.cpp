@@ -737,10 +737,6 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
     }
-    if (parameters.draft &&
-        options.max_context > parameters.model.config().draft->max_position_embeddings) {
-        throw std::invalid_argument("max_context exceeds the selected draft position capacity");
-    }
     // The model's trained window (config max_position_embeddings) stays the native window. YaRN
     // only raises the ceiling the engine will ACCEPT, to native x factor; a factor of 1 leaves
     // the check exactly as upstream ships it.
@@ -758,6 +754,23 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument(
             "max_context exceeds the configured position capacity"
             " (raise --rope-yarn-factor to extend it)");
+    }
+    if (parameters.draft) {
+        // The masked draft consumes the same positions as the target, so its native window is
+        // extended by the same YaRN factor; a factor of 1 leaves the check exactly as upstream
+        // ships it. RoPE stays well defined past the trained span (phases wrap), and for this
+        // family the draft layers are sliding-window, so no visible span is ever exceeded.
+        const auto draft_ceiling = static_cast<std::uint64_t>(
+            static_cast<double>(parameters.model.config().draft->max_position_embeddings) *
+            yarn_factor);
+        if (draft_ceiling > ops::kCausalAttentionMaximumVisibleKeys) {
+            throw std::invalid_argument(
+                "rope_yarn_factor extends the draft context past the attention visible-keys "
+                "ceiling (native context x 4 is the supported maximum)");
+        }
+        if (options.max_context > draft_ceiling) {
+            throw std::invalid_argument("max_context exceeds the selected draft position capacity");
+        }
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
