@@ -1,0 +1,29 @@
+I have a small Python utility that parses an INI-like config file. It has a bug: when the file ends with a key-value pair (no trailing blank line), that final pair is lost from the result. Find the bug, provide the corrected function, and state the one-line fix.
+
+def parse(text):
+    cfg = {}
+    section = None
+    lines = text.splitlines()
+    for i in range(len(lines) - 1):
+        line = lines[i].strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            cfg[section] = {}
+        elif "=" in line and section is not None:
+            k, v = line.split("=", 1)
+            cfg[section][k.strip()] = v.strip()
+    return cfg
+
+Example input:
+
+[alpha]
+a=1
+b=2
+
+[beta]
+x=10
+y=20
+
+Expected result: both sections keep all keys, including "y=20".
